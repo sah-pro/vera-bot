@@ -2,7 +2,7 @@
 Vera Challenge Bot — Complete Submission
 ========================================
 FastAPI server implementing all 5 required endpoints.
-Uses Claude (claude-sonnet-4-20250514) for context-aware message composition.
+Uses Gemini (gemini-1.5-flash) for context-aware message composition.
 """
 
 import os
@@ -15,10 +15,10 @@ from typing import Any, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-import anthropic
+import google.generativeai as genai
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
 TEAM_NAME         = os.environ.get("TEAM_NAME", "Vera Builder")
 TEAM_EMAIL        = os.environ.get("TEAM_EMAIL", "builder@example.com")
 TEAM_MEMBERS      = os.environ.get("TEAM_MEMBERS", "Solo builder").split(",")
@@ -29,13 +29,8 @@ app   = FastAPI(title="Vera Challenge Bot", version=VERSION)
 START = time.time()
 
 # ── In-memory stores ───────────────────────────────────────────────────────────
-# (scope, context_id) → {version, payload}
 contexts: dict[tuple[str, str], dict] = {}
-
-# conversation_id → list of {from_role, message, ts, bot_response}
 conversations: dict[str, list] = {}
-
-# suppression keys we've already sent (prevent duplicate sends in same tick)
 sent_suppression_keys: set[str] = set()
 
 # ── Pydantic models ────────────────────────────────────────────────────────────
@@ -76,7 +71,6 @@ def _count_contexts() -> dict:
     return counts
 
 def _detect_auto_reply(message: str) -> bool:
-    """Detect WhatsApp Business canned auto-replies."""
     auto_reply_patterns = [
         r"thank you for (contacting|reaching out|your message)",
         r"(automated|automatic) (reply|response|message)",
@@ -96,7 +90,6 @@ def _detect_auto_reply(message: str) -> bool:
     return False
 
 def _detect_positive_intent(message: str) -> bool:
-    """Detect merchant saying yes / let's go / proceed."""
     positive_patterns = [
         r"\b(yes|yep|yeah|yup|haan|ha|ok|okay|sure|go ahead|proceed|let'?s do it|please do|karo|kar do|send it|sounds good|great|perfect)\b",
         r"\b(i want to|i'd like to|mujhe chahiye|chalte hain)\b",
@@ -108,7 +101,6 @@ def _detect_positive_intent(message: str) -> bool:
     return False
 
 def _detect_negative_intent(message: str) -> bool:
-    """Detect merchant saying not interested / stop."""
     negative_patterns = [
         r"\b(no|nope|nahi|na|not interested|stop|unsubscribe|don'?t (contact|message|send)|leave me alone|busy|baad mein|later)\b",
         r"\b(not now|abhi nahi|mat bhejo)\b",
@@ -120,7 +112,6 @@ def _detect_negative_intent(message: str) -> bool:
     return False
 
 def _detect_language(merchant: dict) -> str:
-    """Determine if merchant prefers Hindi-English mix."""
     langs = merchant.get("identity", {}).get("languages", ["en"])
     if "hi" in langs:
         return "hi-en"
@@ -194,6 +185,23 @@ SEND_AS RULES:
 - "merchant_on_behalf" ONLY for customer-facing messages (when customer context is present and trigger.scope = "customer")"""
 
 
+def _call_gemini(prompt: str, max_tokens: int = 1000) -> str:
+    """Call Gemini API and return raw text response."""
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel(
+        "gemini-1.5-flash",
+        system_instruction=SYSTEM_PROMPT
+    )
+    response = model.generate_content(
+        prompt,
+        generation_config=genai.types.GenerationConfig(
+            max_output_tokens=max_tokens,
+            temperature=0.0,
+        )
+    )
+    return response.text.strip()
+
+
 def compose_message(
     category: dict,
     merchant: dict,
@@ -201,10 +209,9 @@ def compose_message(
     customer: Optional[dict] = None,
     conversation_history: Optional[list] = None,
 ) -> dict:
-    """Call Claude to compose a context-aware message."""
+    """Call Gemini to compose a context-aware message."""
 
-    if not ANTHROPIC_API_KEY:
-        # Graceful degradation if no API key
+    if not GEMINI_API_KEY:
         return _fallback_compose(category, merchant, trigger, customer)
 
     trigger_kind   = trigger.get("kind", "default")
@@ -215,7 +222,6 @@ def compose_message(
     category_slug  = category.get("slug", "")
     is_customer_facing = (trigger.get("scope") == "customer" and customer is not None)
 
-    # Build digest context for research/regulation triggers
     digest_context = ""
     if trigger_kind in ("research_digest", "regulation_change", "supply_alert"):
         top_item_id = trigger.get("payload", {}).get("top_item_id", "")
@@ -227,10 +233,9 @@ def compose_message(
         if not digest_context and digest_items:
             digest_context = f"\nLATEST DIGEST ITEM:\n{digest_items[0]}\n"
 
-    # Build conversation history context
     history_context = ""
     if conversation_history:
-        recent = conversation_history[-4:]  # last 4 turns
+        recent = conversation_history[-4:]
         history_context = "\nCONVERSATION HISTORY (most recent turns):\n"
         for turn in recent:
             role = turn.get("from_role", turn.get("from", "?"))
@@ -276,27 +281,16 @@ IS CUSTOMER-FACING: {is_customer_facing}
 Compose the message now. Output ONLY valid JSON matching the schema in the system prompt."""
 
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1000,
-            temperature=0,   # deterministic
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
-        raw = response.content[0].text.strip()
-        # Strip markdown fences if present
+        raw = _call_gemini(user_prompt, max_tokens=1000)
         raw = re.sub(r"^```json\s*", "", raw)
         raw = re.sub(r"```\s*$", "", raw)
         import json
-        result = json.loads(raw)
-        return result
-    except Exception as e:
+        return json.loads(raw)
+    except Exception:
         return _fallback_compose(category, merchant, trigger, customer)
 
 
 def _fallback_compose(category: dict, merchant: dict, trigger: dict, customer: Optional[dict]) -> dict:
-    """Rule-based fallback when LLM is unavailable."""
     merchant_name = merchant.get("identity", {}).get("name", "there")
     owner         = merchant.get("identity", {}).get("owner_first_name", "")
     address_name  = owner or merchant_name
@@ -342,12 +336,9 @@ def compose_reply(
     merchant_message: str,
     turn_number: int,
 ) -> dict:
-    """Compose a reply to a merchant/customer message in an ongoing conversation."""
 
-    # ── Auto-reply detection ────────────────────────────────────────────────
     if _detect_auto_reply(merchant_message):
         history = conversations.get(conversation_id, [])
-        # How many auto-replies in a row?
         auto_count = 0
         for turn in reversed(history):
             if turn.get("is_auto_reply"):
@@ -359,7 +350,6 @@ def compose_reply(
                 "action": "end",
                 "rationale": "Auto-reply detected (2nd occurrence). Gracefully exiting — will reach owner/manager directly."
             }
-        # First auto-reply — try once more
         return {
             "action": "send",
             "body": "Samajh gayi — aapki team tak pahunchne se pehle, kya aap khud 2 min mein dekhna chahenge ki exactly kya update karna hai? Main guide kar sakti hoon.",
@@ -367,21 +357,19 @@ def compose_reply(
             "rationale": "Auto-reply detected (1st occurrence). Attempting one more turn to reach real person."
         }
 
-    # ── Negative intent ─────────────────────────────────────────────────────
     if _detect_negative_intent(merchant_message):
         return {
             "action": "end",
             "rationale": "Merchant signaled not interested. Gracefully exiting conversation."
         }
 
-    # ── Positive intent / action ────────────────────────────────────────────
     if _detect_positive_intent(merchant_message):
         merchant = _get_context("merchant", merchant_id) if merchant_id else {}
         category_slug = merchant.get("category_slug", "") if merchant else ""
         category = _get_context("category", category_slug) if category_slug else {}
         customer = _get_context("customer", customer_id) if customer_id else None
 
-        if not ANTHROPIC_API_KEY or not merchant:
+        if not GEMINI_API_KEY or not merchant:
             return {
                 "action": "send",
                 "body": "Bilkul! Draft kar rahi hoon — 2 minutes mein ready hoga. Koi specific angle ya detail add karna chahenge?",
@@ -389,14 +377,12 @@ def compose_reply(
                 "rationale": "Merchant confirmed — proceeding with the requested action."
             }
 
-        # Build conversation history from store
         history = conversations.get(conversation_id, [])
         history_for_llm = [
             {"from_role": t.get("from_role", "?"), "message": t.get("message", "")}
             for t in history[-6:]
         ]
 
-        # Compose a follow-up / action message
         action_prompt = f"""The merchant just said: "{merchant_message}"
 
 This is a POSITIVE INTENT signal — they said yes / proceed. Do NOT ask another qualifying question.
@@ -412,15 +398,7 @@ Conversation history: {history_for_llm}
 Output JSON: {{"body": "...", "cta": "open_ended"|"binary_yes_stop"|"none", "send_as": "vera", "suppression_key": "reply:{conversation_id}:t{turn_number}", "rationale": "..."}}"""
 
         try:
-            client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-            resp = client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=800,
-                temperature=0,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": action_prompt}],
-            )
-            raw = resp.content[0].text.strip()
+            raw = _call_gemini(action_prompt, max_tokens=800)
             raw = re.sub(r"^```json\s*", "", raw)
             raw = re.sub(r"```\s*$", "", raw)
             import json
@@ -434,13 +412,12 @@ Output JSON: {{"body": "...", "cta": "open_ended"|"binary_yes_stop"|"none", "sen
                 "rationale": "Merchant confirmed, proceeding with action. LLM composition in progress."
             }
 
-    # ── General reply — LLM handles ─────────────────────────────────────────
     merchant = _get_context("merchant", merchant_id) if merchant_id else {}
     category_slug = merchant.get("category_slug", "") if merchant else ""
     category = _get_context("category", category_slug) if category_slug else {}
     history = conversations.get(conversation_id, [])
 
-    if not ANTHROPIC_API_KEY or not merchant:
+    if not GEMINI_API_KEY or not merchant:
         return {
             "action": "send",
             "body": "Got it, samajh gayi! Aur kuch chahiye ya koi specific sawaal hai?",
@@ -469,20 +446,11 @@ Rules:
 Output JSON: {{"action": "send"|"wait"|"end", "body": "...", "cta": "open_ended"|"binary_yes_stop"|"none", "rationale": "..."}}"""
 
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        resp = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=400,
-            temperature=0,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": general_prompt}],
-        )
-        raw = resp.content[0].text.strip()
+        raw = _call_gemini(general_prompt, max_tokens=400)
         raw = re.sub(r"^```json\s*", "", raw)
         raw = re.sub(r"```\s*$", "", raw)
         import json
         result = json.loads(raw)
-        # Ensure action is valid
         action = result.get("action", "send")
         if action not in ("send", "wait", "end"):
             action = "send"
@@ -511,7 +479,7 @@ async def healthz():
         "uptime_seconds": int(time.time() - START),
         "contexts_loaded": _count_contexts(),
         "conversations_active": len(conversations),
-        "llm_configured": bool(ANTHROPIC_API_KEY),
+        "llm_configured": bool(GEMINI_API_KEY),
     }
 
 
@@ -520,9 +488,9 @@ async def metadata():
     return {
         "team_name":    TEAM_NAME,
         "team_members": TEAM_MEMBERS,
-        "model":        "claude-sonnet-4-20250514",
+        "model":        "gemini-1.5-flash",
         "approach":     (
-            "Trigger-kind dispatch → Claude sonnet with 4-context prompt → "
+            "Trigger-kind dispatch → Gemini 1.5 Flash with 4-context prompt → "
             "auto-reply detection → intent routing → structured JSON output with rationale. "
             "Stateful conversation with graceful exit logic."
         ),
@@ -558,7 +526,6 @@ async def push_context(body: ContextBody):
 async def tick(body: TickBody):
     actions = []
     for trg_id in body.available_triggers:
-        # Skip if we've already sent this suppression key
         trg_data = contexts.get(("trigger", trg_id))
         if not trg_data:
             continue
@@ -582,17 +549,13 @@ async def tick(body: TickBody):
 
         customer = _get_context("customer", customer_id) if customer_id else None
 
-        # Compose the message
         composed = compose_message(category, merchant, trg, customer)
 
-        # Build conversation ID
         conv_id = f"conv_{merchant_id}_{trg_id}_{int(time.time())}"
 
-        # Track suppression
         if suppression_key:
             sent_suppression_keys.add(suppression_key)
 
-        # Initialise conversation store
         conversations[conv_id] = [{
             "from_role": "bot",
             "message": composed.get("body", ""),
@@ -600,7 +563,6 @@ async def tick(body: TickBody):
             "is_auto_reply": False,
         }]
 
-        # Build template params from merchant name + trigger kind
         merchant_name = merchant.get("identity", {}).get("name", "")
         trigger_kind  = trg.get("kind", "general")
         template_params = [merchant_name, trigger_kind, composed.get("body", "")[:80]]
@@ -619,7 +581,6 @@ async def tick(body: TickBody):
             "rationale":        composed.get("rationale", ""),
         })
 
-        # Cap at 20 actions per tick
         if len(actions) >= 20:
             break
 
@@ -628,7 +589,6 @@ async def tick(body: TickBody):
 
 @app.post("/v1/reply")
 async def reply(body: ReplyBody):
-    # Store the incoming message
     is_auto = _detect_auto_reply(body.message)
     conversations.setdefault(body.conversation_id, []).append({
         "from_role":    body.from_role,
@@ -645,7 +605,6 @@ async def reply(body: ReplyBody):
         turn_number=body.turn_number,
     )
 
-    # Store bot response in history
     if result.get("action") == "send":
         conversations[body.conversation_id].append({
             "from_role": "bot",
@@ -659,7 +618,6 @@ async def reply(body: ReplyBody):
 
 @app.post("/v1/teardown")
 async def teardown():
-    """Optional endpoint — wipe state at end of test."""
     contexts.clear()
     conversations.clear()
     sent_suppression_keys.clear()
